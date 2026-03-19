@@ -1,50 +1,52 @@
 import os
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
+
+from hod_config import BIN_CENTS, N_BINS
+from hod_utils  import load_hod_dataframe
+
 
 os.makedirs('figs/exploration/bernoulli_check', exist_ok=True)
 
-# ── load & bin (identical setup to data_exploration.py) ───────────────────────
-# hod_df    = pd.read_csv('./data/hod_z0.csv')
-hod_df = pd.read_csv('./data/hod_z0_small.csv')
 
-MASS_COL  = 'halo_mp'
-log_edges = np.linspace(11., 15., 41)
-edges     = 10**log_edges
-bin_cents = 10**((log_edges[:-1] + log_edges[1:]) / 2)
-n_bins    = len(bin_cents)   # 40
+def compute_bernoulli_fits(hod_df):
+    """
+    Compute per-bin empirical Bernoulli parameters and a single MC draw.
 
-hod_df['mass_bin'] = pd.cut(hod_df[MASS_COL], bins=edges, labels=False)
+    Returns a list of length N_BINS; each entry is a dict with keys:
+      n, p_sf, p_q, data_sf, data_q, draw_sf, draw_q
+    """
+    rng     = np.random.default_rng(42)
+    results = []
 
-# ── per-bin: empirical means and a single Bernoulli draw ──────────────────────
-rng     = np.random.default_rng(42)
-results = []
+    for b in range(N_BINS):
+        sub = hod_df[hod_df['mass_bin'] == b]
+        n   = len(sub)
 
-for b in range(n_bins):
-    sub = hod_df[hod_df['mass_bin'] == b]
-    n   = len(sub)
+        data_sf = sub['N_cen_SF'].values
+        data_q  = sub['N_cen_Q'].values
 
-    data_sf = sub['N_cen_SF'].values
-    data_q  = sub['N_cen_Q'].values
+        p_sf = data_sf.mean() if n > 0 else np.nan
+        p_q  = data_q.mean()  if n > 0 else np.nan
 
-    p_sf = data_sf.mean() if n > 0 else np.nan
-    p_q  = data_q.mean()  if n > 0 else np.nan
+        draw_sf = (rng.binomial(1, p_sf, size=n)
+                   if (n > 0 and not np.isnan(p_sf)) else np.array([]))
+        draw_q  = (rng.binomial(1, p_q,  size=n)
+                   if (n > 0 and not np.isnan(p_q))  else np.array([]))
 
-    draw_sf = rng.binomial(1, p_sf, size=n) if (n > 0 and not np.isnan(p_sf)) else np.array([])
-    draw_q  = rng.binomial(1, p_q,  size=n) if (n > 0 and not np.isnan(p_q))  else np.array([])
+        results.append({
+            'n'      : n,
+            'p_sf'   : p_sf,
+            'p_q'    : p_q,
+            'data_sf': data_sf,
+            'data_q' : data_q,
+            'draw_sf': draw_sf,
+            'draw_q' : draw_q,
+        })
 
-    results.append({
-        'n'      : n,
-        'p_sf'   : p_sf,
-        'p_q'    : p_q,
-        'data_sf': data_sf,
-        'data_q' : data_q,
-        'draw_sf': draw_sf,
-        'draw_q' : draw_q,
-    })
+    return results
 
-# ── PMF comparison grid ────────────────────────────────────────────────────────
+
 def plot_pmf_grid(results, bin_cents, data_key, draw_key, color, title, fname):
     """
     8×5 grid (40 panels, one per mass bin). Each panel shows the 2-point PMF
@@ -54,13 +56,13 @@ def plot_pmf_grid(results, bin_cents, data_key, draw_key, color, title, fname):
     fig, axes = plt.subplots(nrows, ncols, figsize=(15, 24))
 
     for idx, ax in enumerate(axes.flat):
-        if idx >= n_bins:
+        if idx >= N_BINS:
             ax.set_visible(False)
             continue
 
-        r    = results[idx]
-        data = r[data_key]
-        draw = r[draw_key]
+        bin_result = results[idx]
+        data = bin_result[data_key]
+        draw = bin_result[draw_key]
 
         p1_data = data.mean() if len(data) > 0 else np.nan
         p1_draw = draw.mean() if len(draw) > 0 else np.nan
@@ -78,7 +80,7 @@ def plot_pmf_grid(results, bin_cents, data_key, draw_key, color, title, fname):
         ax.set_xticks([0, 1])
         ax.set_xticklabels(['0', '1'], fontsize=7)
         ax.set_title(rf'$\log M={np.log10(bin_cents[idx]):.2f}$'
-                     rf'  (n={r["n"]})', fontsize=6.5)
+                     rf'  (n={bin_result["n"]})', fontsize=6.5)
         ax.tick_params(labelsize=6)
         if idx == 0:
             ax.legend(fontsize=6)
@@ -89,19 +91,6 @@ def plot_pmf_grid(results, bin_cents, data_key, draw_key, color, title, fname):
     plt.close()
 
 
-plot_pmf_grid(results, bin_cents,
-              data_key='data_sf', draw_key='draw_sf',
-              color='steelblue',
-              title=r'PMF: $N_\mathrm{cen}^\mathrm{SF}$ — Data vs Bernoulli draw',
-              fname='pmf_cen_sf.png')
-
-plot_pmf_grid(results, bin_cents,
-              data_key='data_q', draw_key='draw_q',
-              color='firebrick',
-              title=r'PMF: $N_\mathrm{cen}^\mathrm{Q}$ — Data vs Bernoulli draw',
-              fname='pmf_cen_q.png')
-
-# ── summary plot: mean & Fano factor ─────────────────────────────────────────
 def plot_summary(results, bin_cents):
     """
     Top panel  : mean N_cen^SF and N_cen^Q vs mass.
@@ -111,10 +100,9 @@ def plot_summary(results, bin_cents):
                   Data (solid) vs Bernoulli prediction 1-p (dashed).
                   Deviation here indicates non-Bernoulli behaviour.
     """
-    mean_sf = np.array([r['p_sf'] for r in results])
-    mean_q  = np.array([r['p_q']  for r in results])
+    mean_sf = np.array([bin_result['p_sf'] for bin_result in results])
+    mean_q  = np.array([bin_result['p_q']  for bin_result in results])
 
-    # empirical Fano: Var(N_cen) / Mean(N_cen)
     def fano(data, p):
         if len(data) > 1 and p > 0:
             return np.var(data, ddof=1) / p
@@ -127,16 +115,14 @@ def plot_summary(results, bin_cents):
     fano_sf_bern = 1. - mean_sf
     fano_q_bern  = 1. - mean_q
 
-    # x-offsets so data and Bernoulli markers don't overlap (log-scale: multiply)
-    eps      = 0.04
-    x_data   = bin_cents * (1. - eps)
-    x_bern   = bin_cents * (1. + eps)
+    eps    = 0.04
+    x_data = bin_cents * (1. - eps)
+    x_bern = bin_cents * (1. + eps)
 
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(8, 8),
                                           gridspec_kw={'height_ratios': [3, 1]},
                                           sharex=True)
 
-    # top: mean (data == Bernoulli by construction, shown as sanity check)
     ax_top.loglog(x_data, mean_sf, color='steelblue', ls='-',  marker='o', ms=4,
                   label=r'$\langle N_\mathrm{cen}^\mathrm{SF}\rangle$ data')
     ax_top.loglog(x_data, mean_q,  color='firebrick',  ls='-',  marker='s', ms=4,
@@ -150,7 +136,6 @@ def plot_summary(results, bin_cents):
     ax_top.legend(fontsize=9)
     ax_top.grid(True, which='both', ls=':', alpha=0.4)
 
-    # bottom: Fano factor
     ax_bot.semilogx(x_data, fano_sf_data, color='steelblue', ls='-',  marker='o', ms=4,
                     label=r'$N_\mathrm{cen}^\mathrm{SF}$ data')
     ax_bot.semilogx(x_data, fano_q_data,  color='firebrick',  ls='-',  marker='s', ms=4,
@@ -171,6 +156,25 @@ def plot_summary(results, bin_cents):
     plt.close()
 
 
-plot_summary(results, bin_cents)
+def main():
+    hod_df  = load_hod_dataframe(use_full=False)
+    results = compute_bernoulli_fits(hod_df)
 
-print("Done. Figures saved to figs/exploration/bernoulli_check/")
+    plot_pmf_grid(results, BIN_CENTS,
+                  data_key='data_sf', draw_key='draw_sf',
+                  color='steelblue',
+                  title=r'PMF: $N_\mathrm{cen}^\mathrm{SF}$ — Data vs Bernoulli draw',
+                  fname='pmf_cen_sf.png')
+
+    plot_pmf_grid(results, BIN_CENTS,
+                  data_key='data_q', draw_key='draw_q',
+                  color='firebrick',
+                  title=r'PMF: $N_\mathrm{cen}^\mathrm{Q}$ — Data vs Bernoulli draw',
+                  fname='pmf_cen_q.png')
+
+    plot_summary(results, BIN_CENTS)
+    print("Done. Figures saved to figs/exploration/bernoulli_check/")
+
+
+if __name__ == '__main__':
+    main()

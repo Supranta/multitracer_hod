@@ -1,5 +1,4 @@
 import os
-import psutil
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -13,78 +12,22 @@ import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS, init_to_value
 
+from hod_config          import BIN_CENTS, N_BINS, CEN_PROPS, DATA_FILE_SMALL
+from hod_utils           import (load_hod_dataframe, split_by_central_type,
+                                 do_mem_check, df_memory_use)
+from hod_reproducibility import record_library_versions, save_mcmc_run_config
+
+
 os.makedirs('figs/exploration/lognormal_poisson_check', exist_ok=True)
 
-_proc = psutil.Process()
-
-
-# def mem_gb():
-    # """Return current process RSS in MB."""
-    # return _proc.memory_info().rss / 1024**3
-
-
-def mem_gb():
-    """Return current process RSS (CPU RAM) in MB, and GPU memory if available."""
-    cpu_mb = _proc.memory_info().rss / 1024**3
-    print(f"CPU RAM used: {cpu_mb:.1f} GB")
-
-    try:
-        import pynvml
-        pynvml.nvmlInit()
-        num_gpus = pynvml.nvmlDeviceGetCount()
-        for i in range(num_gpus):
-            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-            # info = pynvml.nvmlMemoryInfo(handle)
-            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            gpu_mb = info.used / 1024**3
-            print(f"GPU {i} memory used: {gpu_mb:.1f} GB")
-    except ImportError:
-        print("GPU memory: pynvml not installed (run `pip install pynvml`)")
-    except pynvml.NVMLError as e:
-        print(f"GPU memory: unavailable ({e})")
-
-    return cpu_mb
-
-def do_mem_check(message=None):
-    if message is not None:
-        print("="*100)
-        print(message)
-        print("="*100)
-    mem_gb()
-    
-def df_memory_use(df):
-    df_mem_use = df.memory_usage(deep=True).sum() / 1024**2  # in MB
-    print("Memory usage for the dataframe: %2.2f MB"%(df_mem_use))
-    
-
-do_mem_check("Checkpoint 0.....")
-
-# ── load & bin (identical setup to other scripts) ─────────────────────────────
-# hod_df    = pd.read_csv('./data/hod_z0.csv')
-hod_df    = pd.read_csv('./data/hod_z0_small.csv')
-MASS_COL  = 'halo_mp'
-log_edges = np.linspace(11., 15., 21)
-edges     = 10**log_edges
-bin_cents = 10**((log_edges[:-1] + log_edges[1:]) / 2)
-n_bins    = len(bin_cents)   # 20
-
-
-hod_df['mass_bin'] = pd.cut(hod_df[MASS_COL], bins=edges, labels=False)
-
-df_sf_cen = hod_df[hod_df['N_cen_SF'] == 1].copy()
-df_q_cen  = hod_df[hod_df['N_cen_Q']  == 1].copy()
-subsets   = {'SF central': df_sf_cen, 'Q central': df_q_cen}
-del hod_df
-
-do_mem_check("Checkpoint 1.....")
 # ── MCMC settings ─────────────────────────────────────────────────────────────
 PRIOR_WIDTH = 0.5   # log-scale width for LogNormal priors
 NUM_WARMUP  = 400
 NUM_SAMPLES = 200
-rng_key     = jax.random.PRNGKey(42)
+RNG_SEED    = 42
 
-do_mem_check("Checkpoint 2.....")
 # ── method-of-moments helpers ─────────────────────────────────────────────────
+
 def sigma_mom(mu, var):
     """
     MoM sigma from mean and variance of N.
@@ -97,6 +40,7 @@ def sigma_mom(mu, var):
     fano = var / mu
     arg  = max(1. + (fano - 1.) / mu, 1e-6)
     return float(np.sqrt(max(np.log(arg), 0.)))
+
 
 def rho_c_mom(mu_sf, mu_q, cov_data, sig_sf, sig_q):
     """
@@ -111,6 +55,7 @@ def rho_c_mom(mu_sf, mu_q, cov_data, sig_sf, sig_q):
     arg = max(arg, 1e-6)
     rho = float(np.log(arg) / (sig_sf * sig_q))
     return float(np.clip(rho, -0.99, 0.99))
+
 
 # ── NumPyro joint lognormal-Poisson model ─────────────────────────────────────
 #
@@ -132,7 +77,6 @@ def make_joint_model(rate_sf_init, rate_q_init, sig_sf_init, sig_q_init, rho_c_i
     def model(data_sf, data_q):
         n = len(data_sf)
 
-        # ── global parameters ─────────────────────────────────────────────────
         rate_sf  = numpyro.sample('rate_sf',
                                   dist.LogNormal(jnp.log(rate_sf_init), PRIOR_WIDTH))
         rate_q   = numpyro.sample('rate_q',
@@ -148,10 +92,9 @@ def make_joint_model(rate_sf_init, rate_q_init, sig_sf_init, sig_q_init, rho_c_i
             dist.Normal(jnp.arctanh(jnp.array(rho_c_init)), PRIOR_WIDTH))
         rho_c = numpyro.deterministic('rho_c', jnp.tanh(rho_c_raw))
 
-        # ── per-halo latent variables drawn jointly from bivariate normal ─────
         cov = jnp.array([[1., rho_c], [rho_c, 1.]])
         with numpyro.plate('halos', n):
-            x = numpyro.sample('x', dist.MultivariateNormal(jnp.zeros(2), cov))
+            x    = numpyro.sample('x', dist.MultivariateNormal(jnp.zeros(2), cov))
             x_sf = x[..., 0]
             x_q  = x[..., 1]
 
@@ -163,120 +106,122 @@ def make_joint_model(rate_sf_init, rate_q_init, sig_sf_init, sig_q_init, rho_c_i
 
     return model
 
-# ── NUTS fits: both central types × 40 mass bins ──────────────────────────────
-fits = {}
 
-for cen_label, df in subsets.items():
-    print(f"\nFitting Joint LN-Poisson  [{cen_label}]")
-    bin_fits = []
+def fit_lognormal_poisson_per_bin(subsets):
+    """
+    Run NUTS for the joint LN-Poisson model per mass bin and central type.
 
-    for b in trange(n_bins):
-        sub    = df[df['mass_bin'] == b]
-        df_memory_use(sub)
-        arr_sf = np.array(sub['N_sat_SF'].values, dtype=np.int32)
-        arr_q  = np.array(sub['N_sat_Q'].values,  dtype=np.int32)
-        n      = len(arr_sf)
-        mass_mean = float(sub[MASS_COL].mean()) if n > 0 else np.nan
+    Returns a dict keyed by cen_label; each value is a list of length N_BINS
+    with None (skipped) or a dict of posterior mean parameters.
+    """
+    rng_key = jax.random.PRNGKey(RNG_SEED)
+    fits    = {}
 
-        mu_sf = float(arr_sf.mean())
-        mu_q  = float(arr_q.mean())
+    for cen_label, df in subsets.items():
+        print(f"\nFitting Joint LN-Poisson  [{cen_label}]")
+        bin_fits = []
 
-        if mu_sf == 0. and mu_q == 0.:
-            bin_fits.append(None)
-            print(f"  bin {b:2d}: skipped  (n={n})")
-            continue
+        for b in trange(N_BINS):
+            sub    = df[df['mass_bin'] == b]
+            df_memory_use(sub)
+            arr_sf = np.array(sub['N_sat_SF'].values, dtype=np.int32)
+            arr_q  = np.array(sub['N_sat_Q'].values,  dtype=np.int32)
+            n      = len(arr_sf)
+            assert arr_sf.shape == arr_q.shape, \
+                f"Bin {b}: N_sat_SF and N_sat_Q have different lengths"
+            mass_mean = float(sub['halo_mp'].mean()) if n > 0 else np.nan
 
-        var_sf   = float(arr_sf.var())
-        var_q    = float(arr_q.var())
-        cov_data = float(np.cov(arr_sf.astype(float), arr_q.astype(float))[0, 1])
-        
-        # MoM initialisations (clamped to avoid degenerate starts)
-        rate_sf_0 = max(mu_sf,  1e-3)
-        rate_q_0  = max(mu_q,   1e-3)
-        sig_sf_0  = max(sigma_mom(mu_sf, var_sf), 1e-3)
-        sig_q_0   = max(sigma_mom(mu_q,  var_q),  1e-3)
-        rho_c_0   = rho_c_mom(mu_sf, mu_q, cov_data, sig_sf_0, sig_q_0)
+            mu_sf = float(arr_sf.mean())
+            mu_q  = float(arr_q.mean())
 
-        print("="*100)
-        print("rate_sf_0: %2.3f"%(rate_sf_0))
-        print("rate_q_0: %2.3f"%(rate_q_0))
-        print("sig_sf_0: %2.3f"%(sig_sf_0))
-        print("sig_q_0: %2.3f"%(sig_q_0))
-        print("cov_data: %2.3f"%(cov_data))
-        print("rho_c_0: %2.3f"%(rho_c_0))
-        print("="*100)
-        rng_key, rng_ = jax.random.split(rng_key)
-        model  = make_joint_model(rate_sf_0, rate_q_0, sig_sf_0, sig_q_0, rho_c_0)
-        kernel = NUTS(model, init_strategy=init_to_value(values={
-            'rate_sf'  : jnp.array(rate_sf_0),
-            'rate_q'   : jnp.array(rate_q_0),
-            'sigma_sf' : jnp.array(sig_sf_0),
-            'sigma_q'  : jnp.array(sig_q_0),
-            'rho_c_raw': jnp.array(float(np.arctanh(rho_c_0))),
-        }))
-        # Note: 'x' (per-halo MVN latents) is not initialised here;
-        # NUTS draws its own starting point for the latent halo vectors.
-        mcmc = MCMC(kernel, num_warmup=NUM_WARMUP,
-                    num_samples=NUM_SAMPLES, progress_bar=True)
-        mcmc.run(rng_, jnp.array(arr_sf), jnp.array(arr_q))
-        s = mcmc.get_samples()
-        rate_sf_s    = float(np.array(s['rate_sf']).mean())
-        rate_sf_std  = float(np.array(s['rate_sf']).std())
-        rate_q_s     = float(np.array(s['rate_q']).mean())
-        rate_q_std   = float(np.array(s['rate_q']).std())
-        sigma_sf_s   = float(np.array(s['sigma_sf']).mean())
-        sigma_sf_std = float(np.array(s['sigma_sf']).std())
-        sigma_q_s    = float(np.array(s['sigma_q']).mean())
-        sigma_q_std  = float(np.array(s['sigma_q']).std())
-        rho_c_s      = float(np.array(s['rho_c']).mean())
-        rho_c_std    = float(np.array(s['rho_c']).std())
-        # print(f"  bin {b:2d}: memory before del mcmc/samples: {mem_gb():.1f} GB")
-        del mcmc, s
-        # print(f"  bin {b:2d}: memory after  del mcmc/samples: {mem_gb():.1f} GB")
+            if mu_sf == 0. and mu_q == 0.:
+                bin_fits.append(None)
+                print(f"  bin {b:2d}: skipped  (n={n})")
+                continue
 
-        print(f"  bin {b:2d}: n={n:7d}  "
-              f"rate_sf={rate_sf_s:.3f}  rate_q={rate_q_s:.3f}  "
-              f"sig_sf={sigma_sf_s:.3f}  sig_q={sigma_q_s:.3f}  "
-              f"rho_c={rho_c_s:.3f}")
+            var_sf   = float(arr_sf.var())
+            var_q    = float(arr_q.var())
+            cov_data = float(np.cov(arr_sf.astype(float), arr_q.astype(float))[0, 1])
 
-        bin_fits.append({
-            'n'         : n,
-            'mass_mean' : mass_mean,
-            'data_sf'   : arr_sf,
-            'data_q'    : arr_q,
-            'rate_sf'   : rate_sf_s,   'rate_sf_std'  : rate_sf_std,
-            'rate_q'    : rate_q_s,    'rate_q_std'   : rate_q_std,
-            'sigma_sf'  : sigma_sf_s,  'sigma_sf_std' : sigma_sf_std,
-            'sigma_q'   : sigma_q_s,   'sigma_q_std'  : sigma_q_std,
-            'rho_c'     : rho_c_s,     'rho_c_std'    : rho_c_std,
-        })
+            rate_sf_0 = max(mu_sf,  1e-3)
+            rate_q_0  = max(mu_q,   1e-3)
+            sig_sf_0  = max(sigma_mom(mu_sf, var_sf), 1e-3)
+            sig_q_0   = max(sigma_mom(mu_q,  var_q),  1e-3)
+            rho_c_0   = rho_c_mom(mu_sf, mu_q, cov_data, sig_sf_0, sig_q_0)
 
-    fits[cen_label] = bin_fits
+            rng_key, rng_key_current = jax.random.split(rng_key)
+            model  = make_joint_model(rate_sf_0, rate_q_0, sig_sf_0, sig_q_0, rho_c_0)
+            kernel = NUTS(model, init_strategy=init_to_value(values={
+                'rate_sf'  : jnp.array(rate_sf_0),
+                'rate_q'   : jnp.array(rate_q_0),
+                'sigma_sf' : jnp.array(sig_sf_0),
+                'sigma_q'  : jnp.array(sig_q_0),
+                'rho_c_raw': jnp.array(float(np.arctanh(rho_c_0))),
+            }))
+            # Note: 'x' (per-halo MVN latents) is not initialised here;
+            # NUTS draws its own starting point for the latent halo vectors.
+            mcmc = MCMC(kernel, num_warmup=NUM_WARMUP,
+                        num_samples=NUM_SAMPLES, progress_bar=True)
+            mcmc.run(rng_key_current, jnp.array(arr_sf), jnp.array(arr_q))
+            samples = mcmc.get_samples()
 
-    # ── save per-bin parameter summary to CSV ─────────────────────────────────
-    _params = ['rate_sf', 'rate_q', 'sigma_sf', 'sigma_q', 'rho_c']
-    rows = []
-    for b, f in enumerate(bin_fits):
-        if f is None:
-            row = {'bin': b, 'log_mass_mean': np.nan, 'n': 0}
-            for p in _params:
-                row[p] = np.nan
-                row[f'{p}_std'] = np.nan
-        else:
-            row = {
-                'bin'          : b,
-                'log_mass_mean': np.log10(f['mass_mean']),
-                'n'            : f['n'],
-            }
-            for p in _params:
-                row[p] = f[p]
-                row[f'{p}_std'] = f[f'{p}_std']
-        rows.append(row)
+            rate_sf_s    = float(np.array(samples['rate_sf']).mean())
+            rate_sf_std  = float(np.array(samples['rate_sf']).std())
+            rate_q_s     = float(np.array(samples['rate_q']).mean())
+            rate_q_std   = float(np.array(samples['rate_q']).std())
+            sigma_sf_s   = float(np.array(samples['sigma_sf']).mean())
+            sigma_sf_std = float(np.array(samples['sigma_sf']).std())
+            sigma_q_s    = float(np.array(samples['sigma_q']).mean())
+            sigma_q_std  = float(np.array(samples['sigma_q']).std())
+            rho_c_s      = float(np.array(samples['rho_c']).mean())
+            rho_c_std    = float(np.array(samples['rho_c']).std())
+            del mcmc, samples
 
-    cen_tag = 'sf_cen' if 'SF' in cen_label else 'q_cen'
-    csv_path = f'figs/exploration/lognormal_poisson_check/params_{cen_tag}.csv'
-    pd.DataFrame(rows).to_csv(csv_path, index=False)
-    print(f"  Saved parameter summary → {csv_path}")
+            print(f"  bin {b:2d}: n={n:7d}  "
+                  f"rate_sf={rate_sf_s:.3f}  rate_q={rate_q_s:.3f}  "
+                  f"sig_sf={sigma_sf_s:.3f}  sig_q={sigma_q_s:.3f}  "
+                  f"rho_c={rho_c_s:.3f}")
+
+            bin_fits.append({
+                'n'         : n,
+                'mass_mean' : mass_mean,
+                'data_sf'   : arr_sf,
+                'data_q'    : arr_q,
+                'rate_sf'   : rate_sf_s,   'rate_sf_std'  : rate_sf_std,
+                'rate_q'    : rate_q_s,    'rate_q_std'   : rate_q_std,
+                'sigma_sf'  : sigma_sf_s,  'sigma_sf_std' : sigma_sf_std,
+                'sigma_q'   : sigma_q_s,   'sigma_q_std'  : sigma_q_std,
+                'rho_c'     : rho_c_s,     'rho_c_std'    : rho_c_std,
+            })
+
+        fits[cen_label] = bin_fits
+
+        # ── save per-bin parameter summary to CSV ─────────────────────────────
+        _params = ['rate_sf', 'rate_q', 'sigma_sf', 'sigma_q', 'rho_c']
+        rows = []
+        for b, f in enumerate(bin_fits):
+            if f is None:
+                row = {'bin': b, 'log_mass_mean': np.nan, 'n': 0}
+                for p in _params:
+                    row[p] = np.nan
+                    row[f'{p}_std'] = np.nan
+            else:
+                row = {
+                    'bin'          : b,
+                    'log_mass_mean': np.log10(f['mass_mean']),
+                    'n'            : f['n'],
+                }
+                for p in _params:
+                    row[p] = f[p]
+                    row[f'{p}_std'] = f[f'{p}_std']
+            rows.append(row)
+
+        cen_tag  = 'sf_cen' if 'SF' in cen_label else 'q_cen'
+        csv_path = f'figs/exploration/lognormal_poisson_check/params_{cen_tag}.csv'
+        pd.DataFrame(rows).to_csv(csv_path, index=False)
+        print(f"  Saved parameter summary → {csv_path}")
+
+    return fits
 
 
 # ── marginal PMF via Monte Carlo integration ──────────────────────────────────
@@ -292,13 +237,13 @@ def poisson_lognormal_pmf(k_arr, rate, sigma):
     rng    = np.random.default_rng(_MC_SEED)
     z      = rng.standard_normal(_N_MC)
     lam    = np.exp(sigma * z - 0.5 * sigma**2)
-    mu_arr = rate * lam                    # shape (_N_MC,)
-    # vectorised: (len(k_arr), _N_MC) → mean over MC axis
-    pmf = scipy_poisson.pmf(k_arr[:, None], mu_arr[None, :]).mean(axis=1)
+    mu_arr = rate * lam
+    pmf    = scipy_poisson.pmf(k_arr[:, None], mu_arr[None, :]).mean(axis=1)
     return pmf
 
 
 # ── PMF comparison grid (marginals) ──────────────────────────────────────────
+
 def plot_pmf_grid(cen_label, sat_key, bin_fits, bin_cents, color, fname):
     """
     4×5 panel grid — one per mass bin.
@@ -330,12 +275,10 @@ def plot_pmf_grid(cen_label, sat_key, bin_fits, bin_cents, color, fname):
         data  = fit[sat_key]
         n     = fit['n']
 
-        # x range from fitted model (mean ± 7σ of marginal N)
         var_n = rate + rate**2 * (np.exp(sigma**2) - 1.)
         N_max = int(np.ceil(rate + 7. * np.sqrt(max(var_n, 0.))))
         k_arr = np.arange(0, N_max + 1)
 
-        # empirical PMF (skip zero-count bins for log scale)
         counts  = np.bincount(data, minlength=N_max + 1)[:N_max + 1]
         emp_pmf = counts / counts.sum()
         mask    = emp_pmf > 0
@@ -363,24 +306,8 @@ def plot_pmf_grid(cen_label, sat_key, bin_fits, bin_cents, color, fname):
     plt.close()
 
 
-for cen_label in ['SF central', 'Q central']:
-    cen_tag = 'sf_cen' if 'SF' in cen_label else 'q_cen'
-    bf      = fits[cen_label]
-    for sat_key, sat_tag, color in [
-        ('data_sf', 'sf_sat', 'steelblue'),
-        ('data_q',  'q_sat',  'firebrick'),
-    ]:
-        print(f"\nPlotting PMF grid: {cen_label} | {sat_key}")
-        plot_pmf_grid(cen_label, sat_key, bf, bin_cents, color,
-                      fname=f'pmf_{sat_tag}_{cen_tag}.png')
-
-# free raw data arrays — no longer needed after PMF plots
-for bf in fits.values():
-    for f in bf:
-        if f is not None:
-            del f['data_sf'], f['data_q']
-
 # ── model-predicted statistics from fit parameters ────────────────────────────
+
 def fit_stats(fit):
     """Return (mean_sf, mean_q, fano_sf, fano_q, corr) from posterior means."""
     r_sf  = fit['rate_sf'];  r_q  = fit['rate_q']
@@ -399,6 +326,7 @@ def fit_stats(fit):
 
 
 # ── summary plot: mean & Fano ─────────────────────────────────────────────────
+
 def plot_summary(fits, subsets, bin_cents):
     """
     2 rows × 2 cols (height_ratios [3,1]).
@@ -410,10 +338,6 @@ def plot_summary(fits, subsets, bin_cents):
     x_data = bin_cents * (1. - eps)
     x_fit  = bin_cents * (1. + eps)
 
-    cen_props = {
-        'SF central': dict(color='steelblue', mk_data='o', mk_fit='^'),
-        'Q central' : dict(color='firebrick',  mk_data='s', mk_fit='D'),
-    }
     sat_specs = [
         ('N_sat_SF', 'rate_sf', 'sigma_sf', r'$N_\mathrm{sat}^\mathrm{SF}$'),
         ('N_sat_Q',  'rate_q',  'sigma_q',  r'$N_\mathrm{sat}^\mathrm{Q}$'),
@@ -427,18 +351,16 @@ def plot_summary(fits, subsets, bin_cents):
         ax_top = axes[0, col_idx]
         ax_bot = axes[1, col_idx]
 
-        for cen_label, props in cen_props.items():
+        for cen_label, props in CEN_PROPS.items():
             color = props['color']
             df    = subsets[cen_label]
             bf    = fits[cen_label]
 
-            # empirical stats
             grp       = df.groupby('mass_bin')[sat_col]
-            mean_data = grp.mean().reindex(range(n_bins)).values
-            var_data  = grp.var(ddof=1).reindex(range(n_bins)).values
+            mean_data = grp.mean().reindex(range(N_BINS)).values
+            var_data  = grp.var(ddof=1).reindex(range(N_BINS)).values
             fano_data = var_data / mean_data
 
-            # model-predicted stats
             rate_fit = np.array([
                 f[rate_key] if f is not None else np.nan for f in bf])
             fano_fit = np.array([
@@ -476,6 +398,7 @@ def plot_summary(fits, subsets, bin_cents):
 
 
 # ── cross-correlation plot: data vs model ─────────────────────────────────────
+
 def plot_cross_correlation(fits, subsets, bin_cents):
     """
     Pearson r between N_sat_SF and N_sat_Q: data (solid) vs LN-P fit (dashed).
@@ -485,26 +408,19 @@ def plot_cross_correlation(fits, subsets, bin_cents):
     x_data = bin_cents * (1. - eps)
     x_fit  = bin_cents * (1. + eps)
 
-    cen_props = {
-        'SF central': dict(color='steelblue', mk_data='o', mk_fit='^', ls='-'),
-        'Q central' : dict(color='firebrick',  mk_data='s', mk_fit='D', ls='--'),
-    }
-
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.axhline(0, color='k', ls=':', lw=0.8)
 
-    for cen_label, props in cen_props.items():
+    for cen_label, props in CEN_PROPS.items():
         color = props['color']
         df    = subsets[cen_label]
         bf    = fits[cen_label]
 
-        # empirical Pearson r per bin
         corr_data = (df.groupby('mass_bin')
                        .apply(lambda g: g['N_sat_SF'].corr(g['N_sat_Q']))
-                       .reindex(range(n_bins))
+                       .reindex(range(N_BINS))
                        .values)
 
-        # model-predicted Pearson r from fit parameters
         corr_fit = np.array([
             fit_stats(f)[4] if f is not None else np.nan for f in bf])
 
@@ -526,12 +442,54 @@ def plot_cross_correlation(fits, subsets, bin_cents):
     plt.close()
 
 
-# ── run plots ─────────────────────────────────────────────────────────────────
-print("\nPlotting summary...")
-plot_summary(fits, subsets, bin_cents)
+def main():
+    record_library_versions(
+        'figs/exploration/lognormal_poisson_check/library_versions.json')
+    save_mcmc_run_config(
+        'figs/exploration/lognormal_poisson_check/run_config.json',
+        config=dict(
+            script_name = 'lognormal_poisson_check.py',
+            num_warmup  = NUM_WARMUP,
+            num_samples = NUM_SAMPLES,
+            prior_width = PRIOR_WIDTH,
+            rng_seed    = RNG_SEED,
+            n_bins      = N_BINS,
+            data_file   = DATA_FILE_SMALL,
+        ),
+    )
 
-print("Plotting cross-correlation...")
-plot_cross_correlation(fits, subsets, bin_cents)
-del subsets
+    do_mem_check("Checkpoint 0 — before data load")
+    hod_df  = load_hod_dataframe(use_full=False)
+    subsets = split_by_central_type(hod_df)
+    do_mem_check("Checkpoint 1 — after data load")
 
-print("\nDone. Figures saved to figs/exploration/lognormal_poisson_check/")
+    fits = fit_lognormal_poisson_per_bin(subsets)
+
+    for cen_label in ['SF central', 'Q central']:
+        cen_tag = 'sf_cen' if 'SF' in cen_label else 'q_cen'
+        bf      = fits[cen_label]
+        for sat_key, sat_tag, color in [
+            ('data_sf', 'sf_sat', 'steelblue'),
+            ('data_q',  'q_sat',  'firebrick'),
+        ]:
+            print(f"\nPlotting PMF grid: {cen_label} | {sat_key}")
+            plot_pmf_grid(cen_label, sat_key, bf, BIN_CENTS, color,
+                          fname=f'pmf_{sat_tag}_{cen_tag}.png')
+
+    # free raw data arrays — no longer needed after PMF plots
+    for bf in fits.values():
+        for f in bf:
+            if f is not None:
+                del f['data_sf'], f['data_q']
+
+    print("\nPlotting summary...")
+    plot_summary(fits, subsets, BIN_CENTS)
+
+    print("Plotting cross-correlation...")
+    plot_cross_correlation(fits, subsets, BIN_CENTS)
+
+    print("\nDone. Figures saved to figs/exploration/lognormal_poisson_check/")
+
+
+if __name__ == '__main__':
+    main()

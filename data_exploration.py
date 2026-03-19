@@ -1,42 +1,59 @@
-import os
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
+import os
+
+from hod_config import BIN_CENTS, N_BINS, CENTRAL_STYLE, COLOR_MAP
+from hod_utils  import load_hod_dataframe, split_by_central_type
+
 
 os.makedirs('figs/exploration', exist_ok=True)
 
-# hod_df = pd.read_csv('./data/hod_z0.csv')
-hod_df = pd.read_csv('./data/hod_z0_small.csv')
 
-# ── mass bins ─────────────────────────────────────────────────────────────────
-MASS_COL  = 'halo_mp'
-log_edges = np.linspace(11., 15., 41)
-edges     = 10**log_edges
-bin_cents = 10**((log_edges[:-1] + log_edges[1:]) / 2)
+# ── helpers ───────────────────────────────────────────────────────────────────
 
-hod_df['mass_bin'] = pd.cut(hod_df[MASS_COL], bins=edges, labels=False)
+def bin_stats(df, col):
+    """
+    Per-bin mean, Fano factor, and their uncertainties.
 
-# ── subsets by central type ───────────────────────────────────────────────────
-df_all    = hod_df.copy()
-df_sf_cen = hod_df[hod_df['N_cen_SF'] == 1].copy()
-df_q_cen  = hod_df[hod_df['N_cen_Q']  == 1].copy()
+    Returns
+    -------
+    mean, fano, sem_mean, sem_fano, n   (all length-N_BINS arrays)
 
-subsets = {
-    'All'        : df_all,
-    'SF central' : df_sf_cen,
-    'Q central'  : df_q_cen,
-}
+    sem_mean = std / sqrt(n)
+    sem_fano = Fano * sqrt(2 / (n-1))   [delta-method, normal approx on s²]
+    """
+    grp      = df.groupby('mass_bin')[col]
+    mean     = grp.mean().reindex(range(N_BINS))
+    var      = grp.var(ddof=1).reindex(range(N_BINS))
+    n        = grp.count().reindex(range(N_BINS), fill_value=0)
+    fano     = var / mean
+    sem_mean = np.sqrt(var) / np.sqrt(n)
+    sem_fano = fano * np.sqrt(2. / (n - 1).clip(lower=1))
+    return (mean.values, fano.values,
+            sem_mean.values, sem_fano.values, n.values.astype(float))
 
-central_style = {
-    'SF central' : ('-',  'o'),
-    'Q central'  : ('--', 's'),
-}
 
-color_map = {
-    'SF central' : 'steelblue',
-    'Q central'  : 'firebrick',
-}
+def bin_corr(df, col_x, col_y):
+    """
+    Per-bin Pearson r with asymmetric Fisher-z error bars.
 
+    Returns r, err_lo, err_hi   (all length-N_BINS arrays).
+    err_lo = r - tanh(arctanh(r) - 1/sqrt(n-3))
+    err_hi = tanh(arctanh(r) + 1/sqrt(n-3)) - r
+    """
+    grp  = df.groupby('mass_bin')
+    r    = (grp.apply(lambda g: g[col_x].corr(g[col_y]))
+               .reindex(range(N_BINS)).values)
+    n    = (grp.size()
+               .reindex(range(N_BINS), fill_value=0).values.astype(float))
+    z    = np.arctanh(np.clip(r, -0.9999, 0.9999))
+    se_z = 1. / np.sqrt(np.maximum(n - 3., 1.))
+    err_lo = r - np.tanh(z - se_z)
+    err_hi = np.tanh(z + se_z) - r
+    return r, err_lo, err_hi
+
+
+# ── plots ─────────────────────────────────────────────────────────────────────
 
 def plot_halo_counts(subsets, bin_cents, central_style):
     """
@@ -60,13 +77,12 @@ def plot_halo_counts(subsets, bin_cents, central_style):
 
     ax_top.set_xlim(1e+11, 1e+15)
     ax_bot.set_xlim(1e+11, 1e+15)
-    
-    # ── top panel: raw counts with Poisson errors ─────────────────────────────
+
     for cen_label, (ls, mk) in central_style.items():
         c   = counts[cen_label]
         err = np.sqrt(c)
         ax_top.errorbar(bin_cents, c, yerr=err,
-                        color=color_map[cen_label], ls=ls, marker=mk, ms=4,
+                        color=COLOR_MAP[cen_label], ls=ls, marker=mk, ms=4,
                         capsize=2, lw=1, label=cen_label)
 
     ax_top.set_xscale('log')
@@ -76,15 +92,13 @@ def plot_halo_counts(subsets, bin_cents, central_style):
     ax_top.legend(fontsize=9, title='Central type')
     ax_top.grid(True, which='both', ls=':', alpha=0.4)
 
-    # ── bottom panel: fractions with propagated Poisson errors ────────────────
     for cen_label, (ls, mk) in central_style.items():
         c   = counts[cen_label]
         f   = np.where(total > 0, c / total, np.nan)
-        # sigma_f = f * sqrt(1/c + 1/total)  (Poisson propagation)
         err = f * np.sqrt(np.where(c > 0, 1. / c, 0.)
                           + np.where(total > 0, 1. / total, 0.))
         ax_bot.errorbar(bin_cents, f, yerr=err,
-                        color=color_map[cen_label], ls=ls, marker=mk, ms=4,
+                        color=COLOR_MAP[cen_label], ls=ls, marker=mk, ms=4,
                         capsize=2, lw=1, label=cen_label)
 
     ax_bot.axhline(1, color='k', ls='--', lw=0.8, alpha=0.4)
@@ -100,49 +114,6 @@ def plot_halo_counts(subsets, bin_cents, central_style):
     plt.close()
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-def bin_stats(df, col):
-    """
-    Per-bin mean, Fano factor, and their uncertainties.
-
-    Returns
-    -------
-    mean, fano, sem_mean, sem_fano, n   (all length-n_bins arrays)
-
-    sem_mean = std / sqrt(n)
-    sem_fano = Fano * sqrt(2 / (n-1))   [delta-method, normal approx on s²]
-    """
-    grp      = df.groupby('mass_bin')[col]
-    mean     = grp.mean().reindex(range(len(bin_cents)))
-    var      = grp.var(ddof=1).reindex(range(len(bin_cents)))
-    n        = grp.count().reindex(range(len(bin_cents)), fill_value=0)
-    fano     = var / mean
-    sem_mean = np.sqrt(var) / np.sqrt(n)
-    sem_fano = fano * np.sqrt(2. / (n - 1).clip(lower=1))
-    return (mean.values, fano.values,
-            sem_mean.values, sem_fano.values, n.values.astype(float))
-
-
-def bin_corr(df, col_x, col_y):
-    """
-    Per-bin Pearson r with asymmetric Fisher-z error bars.
-
-    Returns r, err_lo, err_hi   (all length-n_bins arrays).
-    err_lo = r - tanh(arctanh(r) - 1/sqrt(n-3))
-    err_hi = tanh(arctanh(r) + 1/sqrt(n-3)) - r
-    """
-    grp  = df.groupby('mass_bin')
-    r    = (grp.apply(lambda g: g[col_x].corr(g[col_y]))
-               .reindex(range(len(bin_cents))).values)
-    n    = (grp.size()
-               .reindex(range(len(bin_cents)), fill_value=0).values.astype(float))
-    z    = np.arctanh(np.clip(r, -0.9999, 0.9999))
-    se_z = 1. / np.sqrt(np.maximum(n - 3., 1.))
-    err_lo = r - np.tanh(z - se_z)
-    err_hi = np.tanh(z + se_z) - r
-    return r, err_lo, err_hi
-
-
 def plot_mean_occupation(subsets, bin_cents, central_style):
     """
     Row 1, Panel 1 : mean N_cen^SF and N_cen^Q (all halos).
@@ -152,7 +123,6 @@ def plot_mean_occupation(subsets, bin_cents, central_style):
     fig, axes = plt.subplots(2, 3, figsize=(15, 7),
                              gridspec_kw={'height_ratios': [3, 1]})
 
-    # ── top-left: centrals (all halos) ───────────────────────────────────────
     axes[1, 0].set_visible(False)
     ax = axes[0, 0]
     mean_cen_sf, _, sem_sf, _, _ = bin_stats(subsets['All'], 'N_cen_SF')
@@ -172,7 +142,6 @@ def plot_mean_occupation(subsets, bin_cents, central_style):
     ax.legend(fontsize=9)
     ax.grid(True, which='both', ls=':', alpha=0.4)
 
-    # ── satellite panels ──────────────────────────────────────────────────────
     sat_specs = [
         ('N_sat_SF', 'steelblue', r'SF satellites ($N_\mathrm{sat}^\mathrm{SF}$)', 1),
         ('N_sat_Q',  'firebrick', r'Q satellites ($N_\mathrm{sat}^\mathrm{Q}$)',   2),
@@ -182,7 +151,8 @@ def plot_mean_occupation(subsets, bin_cents, central_style):
         ax_top = axes[0, col_idx]
         ax_bot = axes[1, col_idx]
 
-        means = {}; sems = {}
+        means = {}
+        sems  = {}
         for cen_label, (ls, mk) in central_style.items():
             mean, _, sem, _, _ = bin_stats(subsets[cen_label], sat_col)
             means[cen_label] = mean
@@ -199,12 +169,10 @@ def plot_mean_occupation(subsets, bin_cents, central_style):
         ax_top.grid(True, which='both', ls=':', alpha=0.4)
         ax_top.set_xticklabels([])
 
-        # ── ratio panel with propagated errors ────────────────────────────────
         ref     = means['SF central']
         ref_sem = sems['SF central']
         cen_label, (ls, mk) = 'Q central', central_style['Q central']
         ratio = means[cen_label] / ref
-        # SE(A/B) = (A/B) * sqrt((SE_A/A)^2 + (SE_B/B)^2)
         err   = ratio * np.sqrt(
             (sems[cen_label] / np.where(means[cen_label] > 0, means[cen_label], np.nan))**2
             + (ref_sem / np.where(ref > 0, ref, np.nan))**2)
@@ -235,7 +203,6 @@ def plot_fano(subsets, bin_cents, central_style):
     fig, axes = plt.subplots(2, 3, figsize=(15, 7),
                              gridspec_kw={'height_ratios': [3, 1]})
 
-    # ── top-left: centrals ────────────────────────────────────────────────────
     axes[1, 0].set_visible(False)
     ax = axes[0, 0]
     _, fano_cen_sf, _, sem_fano_sf, _ = bin_stats(subsets['All'], 'N_cen_SF')
@@ -254,7 +221,6 @@ def plot_fano(subsets, bin_cents, central_style):
     ax.legend(fontsize=9)
     ax.grid(True, which='both', ls=':', alpha=0.4)
 
-    # ── satellite panels ──────────────────────────────────────────────────────
     sat_specs = [
         ('N_sat_SF', 'steelblue', r'SF satellites ($N_\mathrm{sat}^\mathrm{SF}$)', 1),
         ('N_sat_Q',  'firebrick', r'Q satellites ($N_\mathrm{sat}^\mathrm{Q}$)',   2),
@@ -264,7 +230,8 @@ def plot_fano(subsets, bin_cents, central_style):
         ax_top = axes[0, col_idx]
         ax_bot = axes[1, col_idx]
 
-        fanos = {}; sem_fanos = {}
+        fanos     = {}
+        sem_fanos = {}
         for cen_label, (ls, mk) in central_style.items():
             _, fano, _, sem_fano, _ = bin_stats(subsets[cen_label], sat_col)
             fanos[cen_label]     = fano
@@ -282,7 +249,6 @@ def plot_fano(subsets, bin_cents, central_style):
         ax_top.grid(True, which='both', ls=':', alpha=0.4)
         ax_top.set_xticklabels([])
 
-        # ── ratio panel with propagated errors ────────────────────────────────
         ref     = fanos['SF central']
         ref_sem = sem_fanos['SF central']
         cen_label, (ls, mk) = 'Q central', central_style['Q central']
@@ -319,7 +285,7 @@ def plot_cross_correlation(subsets, bin_cents, central_style):
     for cen_label, (ls, mk) in central_style.items():
         r, err_lo, err_hi = bin_corr(subsets[cen_label], 'N_sat_SF', 'N_sat_Q')
         ax.errorbar(bin_cents, r, yerr=[err_lo, err_hi],
-                    color=color_map[cen_label], ls=ls, marker=mk, ms=4,
+                    color=COLOR_MAP[cen_label], ls=ls, marker=mk, ms=4,
                     capsize=2, lw=1, alpha=0.85, label=cen_label)
 
     ax.set_xscale('log')
@@ -334,12 +300,20 @@ def plot_cross_correlation(subsets, bin_cents, central_style):
     plt.close()
 
 
-# ── run ───────────────────────────────────────────────────────────────────────
-print("Plotting halo counts....")
-plot_halo_counts(subsets, bin_cents, central_style)
-print("Plotting mean functions....")
-plot_mean_occupation(subsets, bin_cents, central_style)
-print("Plotting variances....")
-plot_fano(subsets, bin_cents, central_style)
-print("Plotting cross-correlations....")
-plot_cross_correlation(subsets, bin_cents, central_style)
+def main():
+    hod_df  = load_hod_dataframe(use_full=False)
+    subsets = split_by_central_type(hod_df)
+    subsets['All'] = hod_df.copy()
+
+    print("Plotting halo counts....")
+    plot_halo_counts(subsets, BIN_CENTS, CENTRAL_STYLE)
+    print("Plotting mean functions....")
+    plot_mean_occupation(subsets, BIN_CENTS, CENTRAL_STYLE)
+    print("Plotting variances....")
+    plot_fano(subsets, BIN_CENTS, CENTRAL_STYLE)
+    print("Plotting cross-correlations....")
+    plot_cross_correlation(subsets, BIN_CENTS, CENTRAL_STYLE)
+
+
+if __name__ == '__main__':
+    main()
